@@ -160,7 +160,6 @@ namespace DynamicMapsExtended
         private static int _nextDecodeStartFrame;
         private static Type _rawImageType;
         private static Type _mapViewType;
-        private static PropertyInfo _isMiniMapActiveProperty;
         private static Type _rectMaskType;
         private static Type _maskType;
         private static PropertyInfo _rawTextureProperty;
@@ -173,7 +172,6 @@ namespace DynamicMapsExtended
         internal static void Initialize()
         {
             _mapViewType = AccessTools.TypeByName("DynamicMaps.UI.Components.MapView");
-            _isMiniMapActiveProperty = _mapViewType == null ? null : AccessTools.Property(_mapViewType, "IsMiniMapActive");
             _rectMaskType = AccessTools.TypeByName("UnityEngine.UI.RectMask2D");
             _maskType = AccessTools.TypeByName("UnityEngine.UI.Mask");
             _rawImageType = AccessTools.TypeByName("UnityEngine.UI.RawImage");
@@ -1209,7 +1207,7 @@ namespace DynamicMapsExtended
             // switches a coherent centre block, not individual checkerboard tiles.
             // Bundled 4K Abstract packs fit the bounded cache even at full-map fit zoom.
             if (state.Abstract && state.MapView != null &&
-                _isMiniMapActiveProperty?.GetValue(state.MapView) is bool mini && !mini &&
+                MapScreenBridge.IsMainViewport(state.MapView) &&
                 state.Pack.Width <= 4096 && state.Pack.Height <= 4096) return true;
 
             var threshold = longEdge >= WarmPreviewLongEdge

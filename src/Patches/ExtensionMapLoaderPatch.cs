@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using HarmonyLib;
+using Newtonsoft.Json;
 
 namespace DynamicMapsExtended
 {
@@ -18,17 +19,33 @@ namespace DynamicMapsExtended
         private static readonly HashSet<string> AcceptableExtensions =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jsonc" };
 
+        private static readonly HashSet<string> SupportedArtworkExtensions =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".svg", ".png" };
+
         private static FieldInfo _writeTimesField;
         private static FieldInfo _mapDefsField;
         private static FieldInfo _nameFilterField;
-        private static MethodInfo _mapDefLoadMethod;
         private static MethodInfo _filteredMethod;
         private static MethodInfo _changeAvailableMethod;
+        private static MethodInfo _registerPreferencesMethod;
         private static Type _mapDefType;
         private static readonly HashSet<string> WarnedUnavailableDefinitions =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly Regex ImagePathRegex =
             new Regex(@"""ImagePath""\s*:\s*""(?<path>[^""]+)""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        // DynamicMaps forgets every definition it did not discover on its own paths, so extension
+        // entries are re-registered after each scan. Reusing the instance keeps an already displayed
+        // MapView untouched: MapView.LoadMap treats the same instance as "already loaded", which is
+        // what preserves live player/quest markers across a map-screen reopen.
+        private static readonly Dictionary<string, CachedDefinition> Definitions =
+            new Dictionary<string, CachedDefinition>(StringComparer.OrdinalIgnoreCase);
+
+        private sealed class CachedDefinition
+        {
+            internal DateTime WriteTime;
+            internal object MapDef;
+        }
 
         private static MethodBase TargetMethod()
         {
@@ -61,13 +78,10 @@ namespace DynamicMapsExtended
             _nameFilterField ??= AccessTools.Field(dropdownType, "_nameFilter");
             _filteredMethod ??= AccessTools.Method(dropdownType, "FilteredMapDefs");
             _changeAvailableMethod ??= AccessTools.Method(dropdownType, "ChangeAvailableMapDefs");
+            _registerPreferencesMethod ??= AccessTools.Method(dropdownType, "RegisterMapPreferences");
 
             _mapDefType ??= AccessTools.TypeByName("DynamicMaps.Data.MapDef")
                 ?? throw new MissingMemberException("DynamicMaps.Data.MapDef not found");
-
-            _mapDefLoadMethod ??= AccessTools.Method(_mapDefType, "LoadFromPath", new[] { typeof(string) });
-            if (_mapDefLoadMethod == null)
-                throw new MissingMethodException(_mapDefType.FullName, "LoadFromPath");
         }
 
         private static void LoadExtensionDefinitions(object dropdown)
@@ -93,30 +107,130 @@ namespace DynamicMapsExtended
                     continue;
 
                 var writeTime = File.GetLastWriteTimeUtc(path);
-                if (writeTimes.Contains(path) && writeTimes[path] is DateTime previous && previous == writeTime)
+                // DynamicMaps drops entries it cannot find on its own paths, so an extension
+                // definition is current only while both dictionaries still hold it.
+                if (mapDefs.Contains(path) &&
+                    writeTimes.Contains(path) && writeTimes[path] is DateTime previous && previous == writeTime)
                     continue;
 
-                var mapDef = _mapDefLoadMethod.Invoke(null, new object[] { path });
+                var mapDef = GetOrLoadDefinition(path, writeTime);
                 if (mapDef == null)
-                {
-                    Plugin.Log?.LogWarning($"DynamicMaps Extended could not load MapDef: {path}");
                     continue;
-                }
 
-                ResolveLayerPaths(mapDef);
+                // Alias definitions ship without duplicated labels/markers. Copying the native
+                // DynamicMaps lists keeps room labels and static markers identical to the map the
+                // alias replaces, instead of asking users to maintain two copies.
                 CopyNativePresentationMetadata(mapDef, mapDefs);
+
                 writeTimes[path] = writeTime;
                 mapDefs[path] = mapDef;
                 changed = true;
 
                 var displayName = AccessTools.Property(mapDef.GetType(), "DisplayName")?.GetValue(mapDef) as string ?? Path.GetFileName(path);
-                Plugin.Debug($"Extension MapDef loaded: {displayName} ({path})");
+                Plugin.Debug($"Extension MapDef registered: {displayName} ({path})");
             }
 
             if (!changed) return;
 
             RefreshDropdown(dropdown);
             Plugin.Debug("DynamicMaps dropdown refreshed with extension MapDefs.");
+        }
+
+        private static object GetOrLoadDefinition(string path, DateTime writeTime)
+        {
+            if (Definitions.TryGetValue(path, out var cached) &&
+                cached.WriteTime == writeTime && cached.MapDef != null)
+                return cached.MapDef;
+
+            Definitions.Remove(path);
+
+            try
+            {
+                var mapDef = JsonConvert.DeserializeObject(File.ReadAllText(path), _mapDefType);
+                if (mapDef == null)
+                    throw new InvalidDataException("The definition deserialized to nothing.");
+
+                ValidateDefinition(mapDef, path);
+                Definitions[path] = new CachedDefinition { WriteTime = writeTime, MapDef = mapDef };
+                return mapDef;
+            }
+            catch (Exception e)
+            {
+                if (WarnedUnavailableDefinitions.Add(path))
+                    Plugin.Log?.LogWarning($"DynamicMaps Extended could not load MapDef {Path.GetFileName(path)}: {e.Message}");
+                return null;
+            }
+        }
+
+        // DynamicMaps 1.3.1 validates and normalizes definitions inside MapDef.LoadFromPath, and
+        // extension files are deliberately loaded without that method so their artwork resolves
+        // against this plugin instead of DynamicMaps' folder. Replicate the same contract here.
+        private static void ValidateDefinition(object mapDef, string path)
+        {
+            var type = mapDef.GetType();
+            var bounds = AccessTools.Property(type, "Bounds")?.GetValue(mapDef);
+            var layers = AccessTools.Property(type, "Layers")?.GetValue(mapDef) as IDictionary;
+            var internalNames = AccessTools.Property(type, "MapInternalNames")?.GetValue(mapDef);
+            var displayName = AccessTools.Property(type, "DisplayName")?.GetValue(mapDef) as string;
+
+            if (bounds == null || layers == null || layers.Count == 0 ||
+                internalNames == null || string.IsNullOrWhiteSpace(displayName))
+                throw new InvalidDataException("Incomplete map definition.");
+
+            ResolveLayerPaths(mapDef);
+
+            foreach (DictionaryEntry entry in layers)
+            {
+                var layerDef = entry.Value;
+                if (layerDef == null)
+                    throw new InvalidDataException($"Layer '{entry.Key}' is empty.");
+
+                var layerType = layerDef.GetType();
+                var imagePath = AccessTools.Property(layerType, "ImagePath")?.GetValue(layerDef) as string;
+                var imageBounds = AccessTools.Property(layerType, "ImageBounds")?.GetValue(layerDef);
+                var gameBounds = AccessTools.Property(layerType, "GameBounds")?.GetValue(layerDef);
+
+                if (string.IsNullOrWhiteSpace(imagePath) || imageBounds == null || gameBounds == null)
+                    throw new InvalidDataException($"Layer '{entry.Key}' is incomplete.");
+
+                if (!SupportedArtworkExtensions.Contains(Path.GetExtension(imagePath)))
+                    throw new InvalidDataException($"Layer '{entry.Key}' uses unsupported artwork: {imagePath}");
+
+                if (!File.Exists(imagePath) || new FileInfo(imagePath).Length == 0)
+                    throw new InvalidDataException($"Layer '{entry.Key}' artwork is missing: {imagePath}");
+            }
+
+            var selectionIdProperty = AccessTools.Property(type, "SelectionId");
+            if (selectionIdProperty != null && selectionIdProperty.CanWrite)
+                selectionIdProperty.SetValue(mapDef, SelectionIdFor(path));
+
+            // Extension definitions are companions to DynamicMaps, not Addons: IsAddon is what makes
+            // DynamicMaps skip their precache and rename their display name.
+            AccessTools.Property(type, "IsAddon")?.SetValue(mapDef, false);
+        }
+
+        // DynamicMaps orders selectable definitions by IsAddon then SelectionId and shows the id when
+        // two definitions share a display name, so extension ids stay stable, unique and sorted
+        // behind the native definition of the same map.
+        private static string SelectionIdFor(string path)
+        {
+            try
+            {
+                var full = Path.GetFullPath(path);
+                var root = Path.GetFullPath(Plugin.ExtensionRoot)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    + Path.DirectorySeparatorChar;
+
+                var relative = full.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+                    ? full.Substring(root.Length)
+                    : Path.GetFileName(full);
+
+                return "dmext/" + relative.Replace('\\', '/');
+            }
+            catch
+            {
+                return "dmext/" + Path.GetFileName(path);
+            }
         }
 
         private static bool ShouldLoadDefinition(string path)
@@ -255,6 +369,21 @@ namespace DynamicMapsExtended
             if (_filteredMethod == null || _changeAvailableMethod == null)
                 throw new MissingMemberException("DynamicMaps dropdown refresh methods were not found.");
 
+            // The extension map list is the authoritative one whenever it changed, so DynamicMaps'
+            // per-location preference entries must learn the extension choices too. That is what
+            // lets a Manimal backport or Satellite definition be selected inside a raid.
+            if (_registerPreferencesMethod != null)
+            {
+                try
+                {
+                    _registerPreferencesMethod.Invoke(dropdown, null);
+                }
+                catch (Exception e)
+                {
+                    Plugin.Debug("Could not register extension map preferences: " + e.Message);
+                }
+            }
+
             var filtered = _filteredMethod.Invoke(dropdown, null);
             var nameFilter = _nameFilterField?.GetValue(dropdown) as string;
 
@@ -378,13 +507,12 @@ namespace DynamicMapsExtended
                     .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                     + Path.DirectorySeparatorChar;
 
+                // Every extension definition stores its own artwork under Maps/. Anything else is
+                // DynamicMaps-relative, exactly like a native definition, so resolve it there.
                 if (!absolute.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                     throw new InvalidDataException($"Extension image path escapes its plugin folder: {imagePath}");
 
-                // Only extension-owned paths are made absolute. A missing source file is left
-                // untouched so DynamicMaps can still resolve its own relative artwork naturally.
-                if (File.Exists(absolute))
-                    imagePathProperty.SetValue(layerDef, absolute);
+                imagePathProperty.SetValue(layerDef, absolute);
             }
         }
     }

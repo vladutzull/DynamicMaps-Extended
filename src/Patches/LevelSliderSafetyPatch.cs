@@ -171,15 +171,18 @@ namespace DynamicMapsExtended
 
             try
             {
-                // DynamicMaps 1.2.1 uses SelectedLevel as an auto-property. An earlier implementation incorrectly
-                // searched for a private _selectedLevel field, which does not exist in the DLL.
+                // SelectedLevel is the supported accessor. In 1.2.1 it was an auto-property; in
+                // 1.3.1 it is a validated property over the private _selectedLevel field.
                 _selectedLevelProperty ??= AccessTools.Property(slider.GetType(), "SelectedLevel");
                 if (_selectedLevelProperty?.CanRead == true &&
                     _selectedLevelProperty.GetValue(slider) is int propertyValue)
                     return propertyValue;
 
-                // Auto-property backing-field fallback if the getter ever becomes inaccessible.
-                _selectedLevelBackingField ??= AccessTools.Field(slider.GetType(), "<SelectedLevel>k__BackingField");
+                // Backing-field fallback if the getter ever becomes inaccessible. DynamicMaps 1.3.1
+                // replaced the auto-property with a validated property over a private _selectedLevel,
+                // so both spellings are searched.
+                _selectedLevelBackingField ??= AccessTools.Field(slider.GetType(), "<SelectedLevel>k__BackingField")
+                    ?? AccessTools.Field(slider.GetType(), "_selectedLevel");
                 if (_selectedLevelBackingField?.GetValue(slider) is int fieldValue)
                     return fieldValue;
             }
